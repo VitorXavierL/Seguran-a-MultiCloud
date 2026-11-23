@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  postgres_aws:
+    image: postgres:16.2-alpine
+    environment:
+      POSTGRES_USER: aws_admin
+      POSTGRES_PASSWORD: aws_secret_password
+      POSTGRES_DB: multicloud_db
+    ports:
+      - "5432:5432"
+
+  gcp_audit:
+    build: .
+    command: gunicorn -w 4 -b 0.0.0.0:5001 gcp_audit:app
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./gcs_bucket_logs:/app/gcs_bucket_logs
+
+  aws_app:
+    build: .
+    command: gunicorn -w 4 -b 0.0.0.0:5000 aws_app:app
+    environment:
+      GCP_AUDIT_URL: http://gcp_audit:5001/audit
+      DATABASE_URL: postgresql://aws_admin:aws_secret_password@postgres_aws:5432/multicloud_db
+    ports:
+      - "5000:5000"
+    depends_on:
+      - postgres_aws
+      - gcp_audit

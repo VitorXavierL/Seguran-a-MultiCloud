@@ -1,56 +1,60 @@
-import requests
-import time
+import os
 import statistics
+import requests
 
-# URL da nossa aplicação principal (AWS) rodando localmente
-AWS_URL = "http://localhost:5000/api/submit"
-TOTAL_REQUESTS = 100
+AWS_URL = "http://127.0.0.1:5000/processar"
+GCS_BUCKET_DIR = "gcs_bucket_logs"
+TOTAL_REQUISICOES = 100
 
-latencias = []
-sucessos = 0
+def calcular_percentil_95(dados):
+    dados_ordenados = sorted(dados)
+    indice = int(0.95 * len(dados_ordenados)) - 1
+    return dados_ordenados[max(0, indice)]
 
-print(f"Iniciando bateria automatizada de {TOTAL_REQUESTS} testes Cross-Cloud...")
-print("Enviando requisições (isso pode levar alguns segundos)...\n")
-
-for i in range(TOTAL_REQUESTS):
-    # Criamos um usuário diferente para cada teste para simular tráfego real
-    payload = {
-        "usuario": f"vitoria_teste_automatizado_{i+1}", 
-        "acao": "login_teste", 
-        "status": "sucesso"
-    }
+def executar_experimento():
+    print(f"Iniciando bateria de testes ({TOTAL_REQUISICOES} requisições)...")
     
-    # Marca o tempo inicial antes de disparar
-    start_time = time.time()
-    
-    try:
-        # Dispara para a AWS (que fará todo o fluxo até a GCP)
-        response = requests.post(AWS_URL, json=payload, timeout=5)
-        
-        # Calcula o tempo total que demorou (em milissegundos)
-        latencia_ms = (time.time() - start_time) * 1000 
-        
-        # Se a AWS e a GCP retornarem sucesso (201 Created)
-        if response.status_code == 201:
-            sucessos += 1
-            latencias.append(latencia_ms)
-            
-    except requests.exceptions.RequestException as e:
-        print(f"Falha na requisição {i+1}: {e}")
+    latencias = []
+    overheads_jwt = []
+    uuids_enviados = []
+    sessao = requests.Session()
 
-# Processamento Estatístico
-if latencias:
-    media = statistics.mean(latencias)
-    desvio_padrao = statistics.stdev(latencias) if len(latencias) > 1 else 0
-    taxa = (sucessos / TOTAL_REQUESTS) * 100
+    for i in range(TOTAL_REQUISICOES):
+        resp = sessao.post(AWS_URL)
+        if resp.status_code == 200:
+            dados = resp.json()
+            latencias.append(dados["latencia_inter_nuvens_ms"])
+            overheads_jwt.append(dados["overhead_jwt_ms"])
+            uuids_enviados.append(dados["uuid"])
 
-    print("=" * 40)
-    print(" RESULTADOS ESTATÍSTICOS DO EXPERIMENTO ")
-    print("=" * 40)
-    print(f"Total de requisições: {TOTAL_REQUESTS}")
-    print(f"Taxa de Sucesso:      {taxa:.1f}% ({sucessos}/{TOTAL_REQUESTS})")
-    print(f"Latência Média:       {media:.2f} ms")
-    print(f"Desvio Padrão:        {desvio_padrao:.2f} ms")
-    print("=" * 40)
-else:
-    print("Nenhuma requisição teve sucesso. Verifique se os servidores AWS e GCP estão rodando.")
+    # Verifica quantos UUIDs realmente foram salvos no "Google Cloud Storage"
+    logs_salvos = 0
+    for uid in uuids_enviados:
+        if os.path.exists(os.path.join(GCS_BUCKET_DIR, f"{uid}.json")):
+            logs_salvos += 1
+
+    taxa_sucesso = (logs_salvos / TOTAL_REQUISICOES) * 100.0
+
+    # Cálculos estatísticos para o Quadro 3 do artigo
+    lat_media = statistics.mean(latencias)
+    lat_mediana = statistics.median(latencias)
+    lat_p95 = calcular_percentil_95(latencias)
+    lat_desvio = statistics.stdev(latencias)
+
+    jwt_media = statistics.mean(overheads_jwt)
+    jwt_mediana = statistics.median(overheads_jwt)
+    jwt_p95 = calcular_percentil_95(overheads_jwt)
+    jwt_desvio = statistics.stdev(overheads_jwt)
+
+    print("\n" + "="*65)
+    print(" RESULTADOS CONSOLIDADOS PARA O QUADRO 3 DO ARTIGO (100 REQS)")
+    print("="*65)
+    print(f"{'Métrica':<30} | {'Média':<8} | {'Mediana':<8} | {'P95':<8} | {'Desvio':<8}")
+    print("-" * 65)
+    print(f"{'Latência inter-nuvens (ms)':<30} | {lat_media:<8.2f} | {lat_mediana:<8.2f} | {lat_p95:<8.2f} | {lat_desvio:<8.2f}")
+    print(f"{'Overhead do JWT (ms)':<30} | {jwt_media:<8.3f} | {jwt_mediana:<8.3f} | {jwt_p95:<8.3f} | {jwt_desvio:<8.3f}")
+    print(f"{'Taxa de sucesso dos logs (%)':<30} | {taxa_sucesso:<8.1f} | {taxa_sucesso:<8.1f} | {taxa_sucesso:<8.1f} | {'0.0':<8}")
+    print("="*65)
+
+if __name__ == "__main__":
+    executar_experimento()

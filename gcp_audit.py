@@ -1,57 +1,80 @@
-from flask import Flask, request, jsonify
-from cryptography.fernet import Fernet
-import jwt
+import os
 import json
 import time
+import base64
+import hashlib
+import jwt
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# A mesma chave secreta para validar a assinatura do JWT
-JWT_SECRET = "super-senha-zero-trust-jwt"
+# Chave secreta compartilhada (simulação de KMS/Segredo)
+JWT_SECRET = "chave_super_secreta_multicloud_tars_2026"
+JWT_ALGORITHM = "HS256"
 
-# Chave AES-256 simulando o GCP Cloud KMS
-AES_KEY = Fernet.generate_key()
-cipher_suite = Fernet(AES_KEY)
+# Chave simétrica de 256 bits (32 bytes) para criptografia em repouso AES-256
+AES_KEY = hashlib.sha256(b"chave_aes256_gcs_multicloud_2026").digest()
 
-@app.route('/api/audit', methods=['POST'])
-def audit():
-    inicio = time.time()
-    
-    # 1. Zero Trust: Filtra tráfego exigindo o JWT no Header
+# Diretório que emula o bucket do Google Cloud Storage (GCS)
+GCS_BUCKET_DIR = "gcs_bucket_logs"
+os.makedirs(GCS_BUCKET_DIR, exist_ok=True)
+
+def cifrar_aes256(dados_dict: dict) -> str:
+    aesgcm = AESGCM(AES_KEY)
+    nonce = os.urandom(12)
+    texto_plano = json.dumps(dados_dict).encode("utf-8")
+    texto_cifrado = aesgcm.encrypt(nonce, texto_plano, None)
+    return base64.b64encode(nonce + texto_cifrado).decode("utf-8")
+
+@app.route('/audit', methods=['POST'])
+def receive_audit_log():
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith("Bearer "):
-        print("Bloqueado: Tentativa de acesso sem Token JWT.")
-        return jsonify({"erro": "Acesso negado. Token ausente."}), 401
-    
+        return jsonify({"erro": "Token JWT ausente (Zero Trust bloqueou)"}), 401
+
     token = auth_header.split(" ")[1]
-    
-    # 2. Validação da Autenticidade do Token
+
+    # Medição exata conforme Quadro 2 do artigo: time.perf_counter_ns()
+    inicio_jwt_ns = time.perf_counter_ns()
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            audience="gcp-audit-service",
+            issuer="aws-core-app"
+        )
     except jwt.ExpiredSignatureError:
         return jsonify({"erro": "Token expirado"}), 401
     except jwt.InvalidTokenError:
-        return jsonify({"erro": "Assinatura invalida"}), 401
+        return jsonify({"erro": "Assinatura JWT inválida"}), 401
+    fim_jwt_ns = time.perf_counter_ns()
 
-    # 3. Gravação de Logs no Cloud Storage com AES-256
-    # Extrai a identidade validada diretamente do token
-    log_data = {
-        "record_id": payload.get("record_id"),
-        "usuario_auditado": payload.get("usuario"),
-        "timestamp_validacao": time.time()
+    jwt_overhead_ms = (fim_jwt_ns - inicio_jwt_ns) / 1_000_000.0
+
+    dados_log = request.get_json()
+    log_uuid = dados_log.get("uuid")
+
+    if not log_uuid:
+        return jsonify({"erro": "UUID ausente no payload"}), 400
+
+    # Aplica criptografia em repouso AES-256 antes de gravar no Cloud Storage
+    payload_criptografado = {
+        "uuid": log_uuid,
+        "algoritmo": "AES-256-GCM",
+        "dados_cifrados": cifrar_aes256(dados_log)
     }
-    
-    log_string = json.dumps(log_data).encode('utf-8')
-    log_criptografado = cipher_suite.encrypt(log_string).decode('utf-8')
 
-    # Gravação física: Simula o bucket do GCP Cloud Storage
-    with open("gcp_cloud_storage_log.txt", "a") as arquivo_storage:
-        arquivo_storage.write(f"{log_criptografado}\n")
+    caminho_arquivo = os.path.join(GCS_BUCKET_DIR, f"{log_uuid}.json")
+    with open(caminho_arquivo, "w", encoding="utf-8") as f:
+        json.dump(payload_criptografado, f, indent=4)
 
-    tempo_overhead = (time.time() - inicio) * 1000
-    print(f"INFO: Log criptografado. Overhead JWT: {tempo_overhead:.2f} ms")
-
-    return jsonify({"status": "audit_saved", "record_id": payload.get("record_id")}), 200
+    return jsonify({
+        "status": "sucesso",
+        "uuid_gravado": log_uuid,
+        "jwt_overhead_ms": jwt_overhead_ms
+    }), 200
 
 if __name__ == '__main__':
-    app.run(port=5001)
+    app.run(host='0.0.0.0', port=5001)
